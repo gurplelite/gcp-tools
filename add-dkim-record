@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+selector="google"
+ttl=3600
+
+usage() {
+  cat <<USAGE
+Usage: $0 -z ZONE -d DOMAIN [-s SELECTOR] [-t TTL] [DKIM_VALUE]
+  -z   Cloud DNS managed zone name (e.g., madhare)
+  -d   Domain (e.g., madhareconsulting.com)
+  -s   DKIM selector (default: google)
+  -t   TTL seconds (default: 3600)
+  DKIM_VALUE: full line like: v=DKIM1; k=rsa; p=MIIBI...
+              If omitted, paste it via stdin (Ctrl-D to end).
+USAGE
+}
+
+zone=""
+domain=""
+while getopts ":z:d:s:t:h" opt; do
+  case "$opt" in
+    z) zone="$OPTARG" ;;
+    d) domain="$OPTARG" ;;
+    s) selector="$OPTARG" ;;
+    t) ttl="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "Missing value for -$OPTARG" >&2; usage; exit 1 ;;
+    \?) echo "Invalid option -$OPTARG" >&2; usage; exit 1 ;;
+  esac
+done
+shift $((OPTIND-1))
+
+
+[[ -n "$zone" && -n "$domain" ]] || { echo "Error: -z and -d are required." >&2; usage; exit 1; }
+
+# Read DKIM value
+if [[ $# -gt 0 ]]; then
+  dkim_raw="$*"
+else
+  echo "Paste DKIM value (end with Ctrl-D):" >&2
+  dkim_raw="$(cat -)"
+fi
+
+# Sanitize: strip CR/LF, outer quotes; if only p=... provided, prepend tags.
+val="$(printf %s "$dkim_raw" | tr -d '\r\n')"
+val="${val#\"}"; val="${val%\"}"
+if [[ "$val" =~ ^p= ]]; then val="v=DKIM1; k=rsa; $val"; fi
+
+# Remove ALL whitespace inside p= (base64 must be continuous)
+val="$(awk -F'p=' '{ if (NF>1) {gsub(/[[:space:]]/,"",$2); print $1 "p=" $2} else {print $0} }' <<<"$val")"
+
+# Build rrdata with quoted 255-char chunks (single TXT RRset)
+rrdata="$(printf %s "$val" | fold -w255 | sed 's/^/"/; s/$/"/' | paste -sd' ' -)"
+
+name="${selector}._domainkey.${domain}."
+
+# Try update, fallback to create
+if ! gcloud dns record-sets update "$name" --zone="$zone" --type=TXT --ttl="$ttl" --rrdatas="$rrdata" >/dev/null 2>&1; then
+  gcloud dns record-sets create "$name" --zone="$zone" --type=TXT --ttl="$ttl" --rrdatas="$rrdata" >/dev/null
+fi
+
+# Show final RRData
+echo "✅ DKIM TXT set for $name (zone: $zone)"
+gcloud dns record-sets describe "$name" --zone="$zone" --type=TXT --format='value(rrdatas)'
